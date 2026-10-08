@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""Algo problems collection: local practice runner for C++ (needs g++/clang++ and Python 3). See README.md.
+
+    ./run                  progress overview (same as `list`)
+    ./run show 12          print a problem statement
+    ./run web 12           open the problem's source page in the browser
+    ./run check 12         build + run the tests for problem 12
+    ./run check            ... for the solution you edited last
+    ./run watch 12         re-run the tests every time you save
+    ./run next | random    pick something to work on
+    ./run reset 12         restore the blank stub (keeps a .bak); also --all, -c, -s
+    ./run selftest         run every test against the bundled reference solutions
+"""
+import argparse
+import concurrent.futures
+import hashlib
+import itertools
+import json
+import os
+import random
+import re
+import resource
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import webbrowser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PROBLEMS = ROOT / "problems"
+REFERENCE = ROOT / "reference"
+LIB = ROOT / "lib"
+BUILD = ROOT / "build"
+STUBS = ROOT / ".stubs"
+PROGRESS = ROOT / ".progress.json"
+CATALOG = json.loads((ROOT / "meta" / "catalog.json").read_text())
+
+CXX = os.environ.get("CXX", "g++")
+STD = os.environ.get("RUN_STD", "-std=c++23")
+COMMON = [STD, "-Werror=return-type", "-pipe"]
+MODES = {
+    "check": ["-O1", "-g1", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+              "-fno-omit-frame-pointer", "-D_GLIBCXX_ASSERTIONS"],
+    "fast": ["-O2"],
+}
+EXTRA = shlex.split(os.environ.get("RUN_CXXFLAGS", ""))
+TEST_ENV = dict(
+    os.environ,
+    ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=0:exitcode=99:handle_abort=1:print_summary=1",
+    UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:exitcode=98",
+)
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+def _c(code):
+    return lambda s: f"\033[{code}m{s}\033[0m" if COLOR else str(s)
+
+green, red, yellow, dim, bold = _c("32"), _c("31"), _c("33"), _c("2"), _c("1")
+DIFF_COLOR = {"Easy": green, "Medium": yellow, "Hard": red}
+SETS = {"core": ("core", "Core 150", "C"), "interview": ("interview", "Interview 150", "I")}
+
+def tags(p):
+    return " ".join(tag for key, _, tag in SETS.values() if key in p["lists"])
+
+def rel(text):
+    return str(text).replace(str(ROOT) + os.sep, "")
+
+def resolve(query):
+    """Problem number, range (1-20), or part of the name."""
+    q = query.strip().lower()
+    if q.isdigit():
+        n = int(q)
+        hits = [p for p in CATALOG if p["id"] == n]
+        if hits:
+            return hits
+        sys.exit(f"no problem #{n}")
+    if "-" in q and all(part.isdigit() for part in q.split("-", 1)):
+        a, b = map(int, q.split("-", 1))
+        return [p for p in CATALOG if a <= p["id"] <= b]
+    exact = [p for p in CATALOG if q in (p["slug"], p["dir"], p["title"].lower())]
+    if exact:
+        return exact
+    words = q.replace("-", " ").split()
+    hits = [p for p in CATALOG if all(w in p["title"].lower() or w in p["slug"] for w in words)]
+    if len(hits) == 1:
+        return hits
+    if not hits:
+        sys.exit(f"no problem matches {query!r}")
+    print(f"{query!r} is ambiguous:")
+    for p in hits:
+        print(f"  {p['id']:3d}  {p['title']}")
+    sys.exit(2)
+
+def resolve_all(queries):
+    out = []
+    for q in queries:
+        for p in resolve(q):
+            if p not in out:
+                out.append(p)
+    return out
+
+def solution_path(p):
+    return PROBLEMS / p["dir"] / "solution.cpp"
+
+def test_path(p):
+    return PROBLEMS / p["dir"] / "test.cpp"
+
+def reference_path(p):
+    return REFERENCE / f"{p['dir']}.cpp"
+
+def last_edited():
+    paths = [(solution_path(p).stat().st_mtime, p) for p in CATALOG if solution_path(p).exists()]
+    return max(paths, key=lambda t: t[0])[1]
+
+def load_progress():
+    try:
+        return json.loads(PROGRESS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+def save_progress(results):
+    if os.environ.get("RUN_NO_PROGRESS"):
+        return
+    prog = load_progress()
+    now = time.strftime("%Y-%m-%d %H:%M")
+    for p, passed in results:
+        prog[p["dir"]] = {"passed": passed, "at": now}
+    tmp = PROGRESS.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(prog, indent=1, sort_keys=True))
+    tmp.replace(PROGRESS)
+
+def status(p, prog):
+    rec = prog.get(p["dir"])
+    if rec:
+        return "solved" if rec["passed"] else "failing"
+    stub, sol = STUBS / f"{p['dir']}.cpp", solution_path(p)
+    if stub.exists() and sol.exists() and stub.read_bytes() != sol.read_bytes():
+        return "edited"
+    return "todo"
+
+MARK = {"solved": green("✓"), "failing": red("✗"), "edited": yellow("~"), "todo": dim("·")}
+
+def _is_gcc():
+    try:
+        out = subprocess.run([CXX, "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        sys.exit(f"compiler {CXX!r} not found (set CXX=...)")
+    return "clang" not in out.lower()
+
+IS_GCC = None
+
+def mode_flags(mode):
+    return COMMON + MODES[mode] + EXTRA
+
+def ensure_pch(mode):
+    """Precompile testing.hpp (g++ only) — cuts each build from ~4s to ~1.5s. Returns include dir or None."""
+    global IS_GCC
+    if IS_GCC is None:
+        IS_GCC = _is_gcc()
+    if not IS_GCC or os.environ.get("RUN_NO_PCH"):
+        return None
+    flags = mode_flags(mode)
+    key = hashlib.sha1(json.dumps([CXX] + flags).encode()).hexdigest()[:10]
+    pdir = BUILD / "pch" / f"{mode}-{key}"
+    gch = pdir / "testing.hpp.gch"
+    newest = max(f.stat().st_mtime for f in LIB.glob("*.hpp"))
+    if gch.exists() and gch.stat().st_mtime >= newest:
+        return pdir
+    pdir.mkdir(parents=True, exist_ok=True)
+    tmp = pdir / f"testing.hpp.gch.{os.getpid()}"
+    print(dim(f"(one-time: precompiling headers for '{mode}' mode ...)"), flush=True)
+    r = subprocess.run([CXX, *flags, "-I", str(LIB), "-x", "c++-header", str(LIB / "testing.hpp"), "-o", str(tmp)],
+                       capture_output=True, text=True)
+    if r.returncode:
+        tmp.unlink(missing_ok=True)
+        print(dim("(precompiled header failed; building without it)"))
+        return None
+    tmp.replace(gch)
+    return pdir
+
+def build(p, target, mode, pch_dir):
+    """Compile problems/<dir>/test.cpp against the solution or the reference.
+    Returns (binary, None) or (None, compiler_errors)."""
+    src = solution_path(p) if target == "solution" else reference_path(p)
+    test = test_path(p)
+    for f in (src, test):
+        if not f.exists():
+            return None, f"missing {rel(f)}"
+    out = BUILD / p["dir"] / f"{target}-{mode}"
+    includes = (["-I", str(pch_dir)] if pch_dir else []) + ["-I", str(LIB)]
+    cmd = [CXX, *mode_flags(mode), *includes, f'-DSOLUTION_FILE="{src}"', str(test), "-o", str(out)]
+    stamp = out.with_name(out.name + ".cmd")
+    deps = [src, test, *LIB.glob("*.hpp")]
+    if (out.exists() and stamp.exists() and stamp.read_text() == shlex.join(cmd)
+            and out.stat().st_mtime >= max(d.stat().st_mtime for d in deps)):
+        return out, None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode:
+        return None, _tidy_compiler(r.stderr)
+    stamp.write_text(shlex.join(cmd))
+    return out, None
+
+def _tidy_compiler(text, max_lines=40):
+    lines = [rel(l) for l in text.splitlines() if l.strip()]
+    errors = [i for i, l in enumerate(lines) if ": error:" in l]
+    start = max(0, errors[0] - 2) if errors else 0
+    out = lines[start:start + max_lines]
+    if len(lines) - start > max_lines:
+        out.append(f"... ({len(lines) - start - max_lines} more lines)")
+    return "compile error:\n" + "\n".join(out)
+
+def _big_stack():
+    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    want = 1 << 30
+    if hard != resource.RLIM_INFINITY:
+        want = min(want, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_STACK, (want, hard))
+    except (ValueError, OSError):
+        pass
+
+def _crash_text(stderr, rc):
+    lines = [rel(l.rstrip()) for l in stderr.splitlines()]
+    keep = []
+    for l in lines:
+        s = l.strip()
+        if ("ERROR: AddressSanitizer" in s or "runtime error:" in s or "Assertion" in s
+                or s.startswith("terminate called") or "what():" in s):
+            keep.append(s.split("==: ", 1)[-1] if s.startswith("==") else s)
+    first_stack = []
+    for l in lines:
+        if "freed by thread" in l or "allocated by thread" in l or "is located" in l:
+            break
+        first_stack.append(l)
+    frames = [l.strip() for l in first_stack
+              if re.match(r"\s*#\d+ ", l) and ("problems/" in l or "reference/" in l)]
+    keep += ["  " + re.sub(r"0x[0-9a-f]+ in ", "", f) for f in frames[:6]]
+    keep += [l for l in lines if l.startswith("SUMMARY:")][:1]
+    if rc < 0:
+        try:
+            name = signal.Signals(-rc).name
+        except ValueError:
+            name = f"signal {-rc}"
+        hint = {"SIGSEGV": " (segmentation fault: null/dangling pointer, or stack overflow from deep recursion)",
+                "SIGABRT": " (abort)", "SIGFPE": " (division by zero)"}.get(name, "")
+        keep.insert(0, f"crashed: {name}{hint}")
+    elif rc == 99:
+        keep.insert(0, "crashed: AddressSanitizer found a memory error")
+    elif rc == 98:
+        keep.insert(0, "crashed: undefined behaviour")
+    if len(keep) <= 1:
+        keep += lines[-12:]
+    return "\n".join(keep)
+
+def list_tests(binary):
+    r = subprocess.run([str(binary), "--list"], capture_output=True, text=True, env=TEST_ENV, timeout=30)
+    return r.stdout.split()
+
+def run_tests(binary, timeout):
+    """Run each test in its own process. Returns [(name, outcome, detail, output, seconds)]
+    with outcome in pass/fail/todo/error/crash/timeout."""
+    results = []
+    for name in list_tests(binary):
+        t0 = time.perf_counter()
+        try:
+            r = subprocess.run([str(binary), "--run", name], capture_output=True, text=True, errors="replace",
+                               env=TEST_ENV, timeout=timeout, preexec_fn=_big_stack)
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+            results.append((name, "timeout", f"took longer than {timeout:g}s (too slow, or an infinite loop)",
+                            out, time.perf_counter() - t0))
+            continue
+        secs = time.perf_counter() - t0
+        output, _, detail = r.stdout.partition("\n@@test-detail\n")
+        outcome = {0: "pass", 10: "fail", 11: "todo", 12: "error"}.get(r.returncode, "crash")
+        if outcome == "crash":
+            detail = _crash_text(r.stderr, r.returncode)
+        results.append((name, outcome, detail.rstrip(), output.rstrip("\n"), secs))
+    return results
+
+def process(p, target, mode, timeout, pch_dir):
+    binary, err = build(p, target, mode, pch_dir)
+    if err:
+        return [], err
+    return run_tests(binary, timeout), None
+
+def header(p):
+    diff = DIFF_COLOR[p["difficulty"]](p["difficulty"])
+    name = bold("%03d %s" % (p["id"], p["title"]))
+    lists = ", ".join(full for key, full, _ in SETS.values() if key in p["lists"])
+    return f"{name}  {diff} · {p['category']}  {dim(lists)}"
+
+def _indent(text, prefix="      ", max_lines=60):
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"... ({len(lines) - max_lines} more lines)"]
+    return "\n".join(prefix + l for l in lines)
+
+def report(p, results, err, verbose, target="solution"):
+    passed = sum(r[1] == "pass" for r in results)
+    ok = err is None and bool(results) and passed == len(results)
+    if not verbose:
+        mark = green("✓") if ok else red("✗")
+        tail = err.splitlines()[0] if err else f"{passed}/{len(results)}"
+        bad = [n for n, o, *_ in results if o != "pass"]
+        extra = dim("  " + ", ".join(bad)) if bad else ""
+        print(f"{mark} {p['id']:03d} {p['title']:<58} {tail}{extra}", flush=True)
+        return ok
+    print(header(p))
+    print(dim(f"    {rel(solution_path(p) if target == 'solution' else reference_path(p))}"))
+    if err:
+        print(red("  ✗ ") + _indent(err, "      ").lstrip())
+        return False
+    for name, outcome, detail, output, secs in results:
+        if outcome == "pass":
+            print(f"  {green('✓')} {name:<28} {dim(f'{secs * 1000:8.0f} ms')}")
+        else:
+            label = {"fail": red("✗"), "error": red("!"), "crash": red("💥"), "timeout": red("⏱"),
+                     "todo": yellow("·")}[outcome]
+            print(f"  {label} {name}")
+            print(_indent(detail))
+        if output.strip():
+            print(dim("      your output:"))
+            print(dim(_indent(output, "        ", 20)))
+    summary = f"{passed}/{len(results)} passed"
+    print(("  " + green(summary + " — solved!")) if ok else ("  " + red(summary)), flush=True)
+    return ok
+
+def run_many(problems, target, mode, timeout, verbose, save, jobs=None):
+    pch_dir = ensure_pch(mode)
+    outcomes = []
+    jobs = jobs or max(1, min(len(problems), os.cpu_count() or 4))
+    with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+        futures = [pool.submit(process, p, target, mode, timeout, pch_dir) for p in problems]
+        for p, fut in zip(problems, futures):
+            results, err = fut.result()
+            outcomes.append((p, report(p, results, err, verbose, target)))
+            if verbose and len(problems) > 1:
+                print()
+    if save:
+        save_progress(outcomes)
+    if len(problems) > 1:
+        n_ok = sum(ok for _, ok in outcomes)
+        print(bold(f"\n{n_ok}/{len(outcomes)} problems passing"))
+    return all(ok for _, ok in outcomes)
+
+def _matches_filters(p, args):
+    if getattr(args, "set", None) and SETS[args.set][0] not in p["lists"]:
+        return False
+    if getattr(args, "difficulty", None) and p["difficulty"].lower() != args.difficulty.lower():
+        return False
+    if getattr(args, "category", None) and args.category.lower() not in p["category"].lower():
+        return False
+    return True
+
+def cmd_list(args):
+    prog = load_progress()
+    shown = [p for p in CATALOG if _matches_filters(p, args)]
+    by_cat = {}
+    for p in shown:
+        by_cat.setdefault(p["category"], []).append(p)
+    total = 0
+    for cat, ps in by_cat.items():
+        solved = sum(status(p, prog) == "solved" for p in ps)
+        total += solved
+        print(bold(f"\n{cat}") + dim(f"  {solved}/{len(ps)}"))
+        for p in ps:
+            st = status(p, prog)
+            diff = DIFF_COLOR[p["difficulty"]](f"{p['difficulty']:<6}")
+            when = dim(f"  {prog[p['dir']]['at']}") if p["dir"] in prog else ""
+            prem = dim(" (premium)") if p.get("premium") else ""
+            print(f"  {MARK[st]} {p['id']:3d}  {p['title']:<58} {dim(f'{tags(p):<3}')}  {diff}{prem}{when}")
+    print(bold(f"\nSolved {total}/{len(shown)}") + dim("   ✓ solved  ✗ failing  ~ edited  · todo"))
+    for key, full, tag in SETS.values():
+        members = [p for p in shown if key in p["lists"]]
+        if members and len(members) != len(shown):
+            done = sum(status(p, prog) == "solved" for p in members)
+            print(dim(f"  {tag} = {full}: {done}/{len(members)}"))
+
+def _statement(p):
+    for path in (solution_path(p), STUBS / f"{p['dir']}.cpp"):
+        try:
+            m = re.match(r"\s*/\*(.*?)\*/", path.read_text(), re.S)
+            if m:
+                return m.group(1).strip("\n")
+        except OSError:
+            pass
+    return "(no description found)"
+
+def cmd_show(args):
+    for p in resolve_all(args.problems) if args.problems else [last_edited()]:
+        print(_statement(p))
+        print(dim(f"\nedit:  {rel(solution_path(p))}\ncheck: ./run check {p['id']}\n"))
+
+def cmd_web(args):
+    p = resolve(args.problem)[0] if args.problem else last_edited()
+    print(p["url"])
+    webbrowser.open(p["url"])
+
+def _selected(args):
+    if args.all or args.category or args.difficulty or args.set:
+        return [p for p in CATALOG if _matches_filters(p, args)]
+    if args.problems:
+        return resolve_all(args.problems)
+    p = last_edited()
+    print(dim(f"(no problem given — using the last edited one: {p['id']} {p['title']})"))
+    return [p]
+
+def cmd_check(args):
+    problems = _selected(args)
+    verbose = args.verbose or len(problems) == 1
+    mode = "fast" if args.fast else "check"
+    ok = run_many(problems, "solution", mode, args.timeout, verbose, save=not args.fast)
+    sys.exit(0 if ok else 1)
+
+def cmd_watch(args):
+    p = resolve(args.problem)[0] if args.problem else last_edited()
+    files = [solution_path(p), test_path(p)]
+    mode = "fast" if args.fast else "check"
+
+    def stamp():
+        return [f.stat().st_mtime if f.exists() else 0 for f in files]
+
+    last = None
+    try:
+        while True:
+            now = stamp()
+            if now != last:
+                last = now
+                print("\033[2J\033[H", end="")
+                run_many([p], "solution", mode, args.timeout, True, save=not args.fast)
+                print(dim(f"\nwatching {rel(files[0])} — Ctrl-C to stop"))
+            time.sleep(0.4)
+    except KeyboardInterrupt:
+        print()
+
+def _unsolved(args):
+    prog = load_progress()
+    return [p for p in CATALOG if _matches_filters(p, args) and status(p, prog) != "solved"]
+
+def cmd_next(args):
+    todo = _unsolved(args)
+    if not todo:
+        print(green("Everything matching is solved. 🎉"))
+        return
+    args.problems = [str(todo[0]["id"])]
+    cmd_show(args)
+
+def cmd_random(args):
+    todo = _unsolved(args)
+    if not todo:
+        print(green("Everything matching is solved. 🎉"))
+        return
+    args.problems = [str(random.choice(todo)["id"])]
+    cmd_show(args)
+
+def _backup_path(sol):
+    """solution.cpp.bak, else .bak.1, .bak.2, ... so an older backup is never overwritten.
+    Returns (path, needs_copy); needs_copy is False when an identical backup already exists."""
+    data = sol.read_bytes()
+    for i in itertools.count():
+        bak = sol.with_name("solution.cpp.bak" + (f".{i}" if i else ""))
+        if not bak.exists():
+            return bak, True
+        if bak.read_bytes() == data:
+            return bak, False
+
+def cmd_reset(args):
+    if args.all or args.category or args.difficulty or args.set:
+        problems = [p for p in CATALOG if _matches_filters(p, args)]
+    elif args.problems:
+        problems = resolve_all(args.problems)
+    else:
+        sys.exit("say what to reset, e.g. `./run reset 12`, `./run reset -c trees` or `./run reset --all`")
+    prog = load_progress()
+
+    def edited(p):
+        stub, sol = STUBS / f"{p['dir']}.cpp", solution_path(p)
+        return stub.exists() and (not sol.exists() or sol.read_bytes() != stub.read_bytes())
+
+    todo = [p for p in problems if edited(p) or p["dir"] in prog]
+    if not todo:
+        print("nothing to reset: " + ("already a blank stub" if len(problems) == 1 else "all of these are blank stubs"))
+        return
+    if len(problems) > 1 and not args.yes:
+        n_edit = sum(edited(p) for p in todo)
+        question = (f"Reset {n_edit} edited solution(s) to blank stubs and clear the progress of {len(todo)} "
+                    f"problem(s)? Your versions are kept as solution.cpp.bak. [y/N] ")
+        if not sys.stdin.isatty():
+            sys.exit("not resetting several problems without confirmation; add --yes")
+        if input(question).strip().lower() not in ("y", "yes"):
+            print("cancelled")
+            return
+    for p in todo:
+        stub, sol = STUBS / f"{p['dir']}.cpp", solution_path(p)
+        if edited(p):
+            if sol.exists():
+                bak, needs_copy = _backup_path(sol)
+                if needs_copy:
+                    shutil.copy2(sol, bak)
+                print(dim(f"saved your version to {rel(bak)}"))
+            shutil.copy2(stub, sol)
+        prog.pop(p["dir"], None)
+        print(f"reset {p['id']:03d} {p['title']}")
+    tmp = PROGRESS.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(prog, indent=1, sort_keys=True))
+    tmp.replace(PROGRESS)
+    if len(problems) > 1:
+        print(bold(f"reset {len(todo)} problem(s); the other {len(problems) - len(todo)} were already blank"))
+
+def cmd_selftest(args):
+    problems = resolve_all(args.problems) if args.problems else CATALOG
+    mode = "fast" if args.fast else "check"
+    ok = run_many(problems, "reference", mode, args.timeout, args.verbose, save=False)
+    sys.exit(0 if ok else 1)
+
+def cmd_clean(args):
+    shutil.rmtree(BUILD, ignore_errors=True)
+    write_compile_commands()
+    print("removed build/")
+
+def write_compile_commands():
+    """compile_commands.json so clangd/IDEs understand solution.cpp and test.cpp."""
+    entries = []
+    base = [CXX, STD, "-I", str(LIB)]
+    for p in CATALOG:
+        sol = solution_path(p)
+        for f, extra in ((sol, []), (test_path(p), [f'-DSOLUTION_FILE="{sol}"']), (reference_path(p), [])):
+            entries.append({"directory": str(f.parent), "file": str(f),
+                            "arguments": [*base, *extra, "-c", str(f)]})
+    text = json.dumps(entries, indent=1)
+    path = BUILD / "compile_commands.json"
+    try:
+        if path.read_text() == text:
+            return
+    except OSError:
+        pass
+    BUILD.mkdir(exist_ok=True)
+    path.write_text(text)
+
+def main():
+    ap = argparse.ArgumentParser(description="Algo problems collection: local practice runner (C++)",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="Problems can be given as 12, 1-20, two-sum or 'rain water'.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def filters(sp):
+        sp.add_argument("-s", "--set", choices=list(SETS), help="only the Core 150 or only the Interview 150")
+        sp.add_argument("-c", "--category", help="filter by category (substring, e.g. 'graph')")
+        sp.add_argument("-d", "--difficulty", choices=["easy", "medium", "hard"], type=str.lower)
+
+    def running(sp):
+        sp.add_argument("-t", "--timeout", type=float, default=5.0, help="seconds per test (default 5)")
+        sp.add_argument("--fast", action="store_true", help="-O2 without sanitizers (faster, but memory bugs go unnoticed)")
+
+    sp = sub.add_parser("list", help="progress overview")
+    filters(sp)
+    sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("show", help="print problem statement(s)")
+    sp.add_argument("problems", nargs="*")
+    sp.set_defaults(fn=cmd_show)
+
+    sp = sub.add_parser("web", help="open the problem's source page in the browser")
+    sp.add_argument("problem", nargs="?")
+    sp.set_defaults(fn=cmd_web)
+
+    sp = sub.add_parser("check", help="build + run tests (default: last edited solution)")
+    sp.add_argument("problems", nargs="*")
+    sp.add_argument("-a", "--all", action="store_true", help="every problem")
+    sp.add_argument("-v", "--verbose", action="store_true", help="details even when checking many")
+    filters(sp)
+    running(sp)
+    sp.set_defaults(fn=cmd_check)
+
+    sp = sub.add_parser("watch", help="re-run tests on every save")
+    sp.add_argument("problem", nargs="?")
+    running(sp)
+    sp.set_defaults(fn=cmd_watch)
+
+    for name, fn, helptext in (("next", cmd_next, "first unsolved problem"),
+                               ("random", cmd_random, "random unsolved problem")):
+        sp = sub.add_parser(name, help=helptext)
+        filters(sp)
+        sp.set_defaults(fn=fn)
+
+    sp = sub.add_parser("reset", help="restore blank stubs (your versions are kept as solution.cpp.bak)")
+    sp.add_argument("problems", nargs="*")
+    sp.add_argument("-a", "--all", action="store_true", help="every problem")
+    sp.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
+    filters(sp)
+    sp.set_defaults(fn=cmd_reset)
+
+    sp = sub.add_parser("selftest", help="run tests against the reference solutions")
+    sp.add_argument("problems", nargs="*")
+    sp.add_argument("-v", "--verbose", action="store_true")
+    running(sp)
+    sp.set_defaults(fn=cmd_selftest)
+
+    sp = sub.add_parser("clean", help="delete build/")
+    sp.set_defaults(fn=cmd_clean)
+
+    args = ap.parse_args()
+    if not args.cmd:
+        args = ap.parse_args(["list"])
+    write_compile_commands()
+    args.fn(args)
+
+if __name__ == "__main__":
+    main()
